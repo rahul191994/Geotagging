@@ -1,26 +1,29 @@
 from datetime import datetime
 import os
 from flask import Flask, redirect, render_template, request
-import sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
 
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))
-DB_PATH = os.path.join(BASE_DIR, 'geotagging.db')
+# Retrieve the Supabase database URL from Render environment variables
+DATABASE_URL = os.environ.get('DATABASE_URL')
 
 
 def get_db():
-  conn = sqlite3.connect(DB_PATH)
-  conn.row_factory = sqlite3.Row
+  # Connect to PostgreSQL using RealDictCursor so rows behave like dictionaries
+  conn = psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
   return conn
 
 
 def init_db():
   conn = get_db()
   cursor = conn.cursor()
+
+  # PostgreSQL syntax: use SERIAL instead of AUTOINCREMENT
   cursor.execute('''
         CREATE TABLE IF NOT EXISTS district_progress (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             district_name TEXT UNIQUE NOT NULL,
             zonal_office TEXT NOT NULL,
             eligible_societies INTEGER NOT NULL,
@@ -41,28 +44,32 @@ def init_db():
   ]
 
   for district, zonal, eligible in districts_data:
-    # Using only the date format: YYYY-MM-DD
+    # PostgreSQL syntax: use ON CONFLICT instead of INSERT OR IGNORE and %s placeholders
     cursor.execute(
         """
-            INSERT OR IGNORE INTO district_progress (district_name, zonal_office, eligible_societies, geotagged_societies, updated_at)
-            VALUES (?, ?, ?, 0, ?)
+            INSERT INTO district_progress (district_name, zonal_office, eligible_societies, geotagged_societies, updated_at)
+            VALUES (%s, %s, %s, 0, %s)
+            ON CONFLICT (district_name) DO NOTHING
         """,
         (district, zonal, eligible, datetime.now().strftime('%Y-%m-%d')),
     )
 
   conn.commit()
+  cursor.close()
   conn.close()
 
 
+# Initialize table and default data on startup
 init_db()
 
 
 @app.route('/')
 def dashboard():
   conn = get_db()
-  records = conn.execute(
-      'SELECT * FROM district_progress ORDER BY district_name'
-  ).fetchall()
+  cursor = conn.cursor()
+  cursor.execute('SELECT * FROM district_progress ORDER BY district_name')
+  records = cursor.fetchall()
+  cursor.close()
   conn.close()
   return render_template('index.html', records=records)
 
@@ -71,20 +78,22 @@ def dashboard():
 def update_progress():
   district = request.form['district_name']
   daily_added = int(request.form['daily_added'])
-  # Capture only the date (YYYY-MM-DD)
   current_date = datetime.now().strftime('%Y-%m-%d')
 
   conn = get_db()
-  conn.execute(
+  cursor = conn.cursor()
+  # PostgreSQL uses LEAST() instead of MIN() for columns in some contexts, or LEAST works identically here
+  cursor.execute(
       """
         UPDATE district_progress 
-        SET geotagged_societies = MIN(eligible_societies, geotagged_societies + ?),
-            updated_at = ?
-        WHERE district_name = ?
+        SET geotagged_societies = LEAST(eligible_societies, geotagged_societies + %s),
+            updated_at = %s
+        WHERE district_name = %s
     """,
       (daily_added, current_date, district),
   )
   conn.commit()
+  cursor.close()
   conn.close()
   return redirect('/')
 
@@ -93,21 +102,22 @@ def update_progress():
 def update_eligible():
   district = request.form['district_name']
   new_eligible = int(request.form['new_eligible'])
-  # Capture only the date (YYYY-MM-DD)
   current_date = datetime.now().strftime('%Y-%m-%d')
 
   conn = get_db()
-  conn.execute(
+  cursor = conn.cursor()
+  cursor.execute(
       """
         UPDATE district_progress 
-        SET eligible_societies = ?,
-            geotagged_societies = MIN(?, geotagged_societies),
-            updated_at = ?
-        WHERE district_name = ?
+        SET eligible_societies = %s,
+            geotagged_societies = LEAST(%s, geotagged_societies),
+            updated_at = %s
+        WHERE district_name = %s
     """,
       (new_eligible, new_eligible, current_date, district),
   )
   conn.commit()
+  cursor.close()
   conn.close()
   return redirect('/')
 
